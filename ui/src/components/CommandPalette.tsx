@@ -884,8 +884,35 @@ function CommandPalette({
       });
     }
 
-    // Use search results if we have a query, otherwise use initial conversations
-    const conversationsToShow = trimmedQuery ? searchResults : conversations;
+    // Build the list of conversations to show. For an empty query, show the
+    // (un-archived) conversations we already have in memory. For a non-empty
+    // query, the server search covers archived conversations + message-body
+    // FTS — but it's slow (debounced + HTTP + FTS). The common case of
+    // "find an un-archived conversation by name" should feel instant, so we
+    // fuzzy-match the in-memory list by name first and merge the (eventual)
+    // server results in behind them, deduping by conversation_id.
+    let conversationsToShow: ConversationWithState[];
+    if (!trimmedQuery) {
+      conversationsToShow = conversations;
+    } else {
+      const scored: { conv: ConversationWithState; score: number }[] = [];
+      for (const conv of conversations) {
+        const name = conv.slug || conv.conversation_id;
+        let score = fuzzyMatch(trimmedQuery, name);
+        if (conv.cwd) {
+          const cwdScore = fuzzyMatch(trimmedQuery, conv.cwd);
+          if (cwdScore > score) score = cwdScore * 0.5;
+        }
+        if (score > 0) scored.push({ conv, score });
+      }
+      scored.sort((a, b) => b.score - a.score);
+      const localMatches = scored.map((s) => s.conv);
+      const seen = new Set(localMatches.map((c) => c.conversation_id));
+      const extraServerResults = searchResults.filter(
+        (c) => !seen.has(c.conversation_id),
+      );
+      conversationsToShow = [...localMatches, ...extraServerResults];
+    }
     const conversationItems = conversationsToShow.map(conversationToItem);
 
     return [...filteredActions, ...conversationItems];
