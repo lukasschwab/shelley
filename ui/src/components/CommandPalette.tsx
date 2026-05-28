@@ -4,6 +4,7 @@ import { api } from "../services/api";
 import { messageStore } from "../services/messageStore";
 import { useMarkdown } from "../contexts/MarkdownContext";
 import { useI18n, type Locale } from "../i18n";
+import { fuzzyMatch, mergeConversationMatches } from "./commandPaletteSearch";
 
 interface CommandItem {
   id: string;
@@ -38,41 +39,6 @@ interface CommandPaletteProps {
   hasCwd: boolean;
 }
 
-// Simple fuzzy match for actions - returns score (higher is better), -1 if no match
-function fuzzyMatch(query: string, text: string): number {
-  const lowerQuery = query.toLowerCase();
-  const lowerText = text.toLowerCase();
-
-  // Exact match gets highest score
-  if (lowerText === lowerQuery) return 1000;
-
-  // Starts with gets high score
-  if (lowerText.startsWith(lowerQuery)) return 500 + (lowerQuery.length / lowerText.length) * 100;
-
-  // Contains gets medium score
-  if (lowerText.includes(lowerQuery)) return 100 + (lowerQuery.length / lowerText.length) * 50;
-
-  // Fuzzy match - all query chars must appear in order
-  let queryIdx = 0;
-  let score = 0;
-  let consecutiveBonus = 0;
-
-  for (let i = 0; i < lowerText.length && queryIdx < lowerQuery.length; i++) {
-    if (lowerText[i] === lowerQuery[queryIdx]) {
-      score += 1 + consecutiveBonus;
-      consecutiveBonus += 0.5;
-      queryIdx++;
-    } else {
-      consecutiveBonus = 0;
-    }
-  }
-
-  // All query chars must be found
-  if (queryIdx !== lowerQuery.length) return -1;
-
-  return score;
-}
-
 function CommandPalette({
   isOpen,
   onClose,
@@ -96,6 +62,8 @@ function CommandPalette({
 }: CommandPaletteProps) {
   const [query, setQuery] = useState("");
   const [selectedIndex, setSelectedIndex] = useState(0);
+  // Server-side slug+body search results. Fills in message-body matches
+  // the in-memory fuzzy match (see displayItems) can't see.
   const [searchResults, setSearchResults] = useState<ConversationWithState[]>([]);
   const [isSearching, setIsSearching] = useState(false);
   const [isCreatingWorktree, setIsCreatingWorktree] = useState(false);
@@ -110,14 +78,12 @@ function CommandPalette({
   const listRef = useRef<HTMLDivElement>(null);
   const searchTimeoutRef = useRef<number | null>(null);
 
-  // Search conversations on the server
   const searchConversations = useCallback(async (searchQuery: string) => {
     if (!searchQuery.trim()) {
       setSearchResults([]);
       setIsSearching(false);
       return;
     }
-
     setIsSearching(true);
     try {
       const results = await api.searchConversations(searchQuery);
@@ -884,35 +850,13 @@ function CommandPalette({
       });
     }
 
-    // Build the list of conversations to show. For an empty query, show the
-    // (un-archived) conversations we already have in memory. For a non-empty
-    // query, the server search covers archived conversations + message-body
-    // FTS — but it's slow (debounced + HTTP + FTS). The common case of
-    // "find an un-archived conversation by name" should feel instant, so we
-    // fuzzy-match the in-memory list by name first and merge the (eventual)
-    // server results in behind them, deduping by conversation_id.
-    let conversationsToShow: ConversationWithState[];
-    if (!trimmedQuery) {
-      conversationsToShow = conversations;
-    } else {
-      const scored: { conv: ConversationWithState; score: number }[] = [];
-      for (const conv of conversations) {
-        const name = conv.slug || conv.conversation_id;
-        let score = fuzzyMatch(trimmedQuery, name);
-        if (conv.cwd) {
-          const cwdScore = fuzzyMatch(trimmedQuery, conv.cwd);
-          if (cwdScore > score) score = cwdScore * 0.5;
-        }
-        if (score > 0) scored.push({ conv, score });
-      }
-      scored.sort((a, b) => b.score - a.score);
-      const localMatches = scored.map((s) => s.conv);
-      const seen = new Set(localMatches.map((c) => c.conversation_id));
-      const extraServerResults = searchResults.filter(
-        (c) => !seen.has(c.conversation_id),
-      );
-      conversationsToShow = [...localMatches, ...extraServerResults];
-    }
+    // Local fuzzy matches render instantly; server results merge in behind
+    // them as they arrive, deduped by conversation_id.
+    const conversationsToShow = mergeConversationMatches(
+      trimmedQuery,
+      conversations,
+      searchResults,
+    );
     const conversationItems = conversationsToShow.map(conversationToItem);
 
     return [...filteredActions, ...conversationItems];
